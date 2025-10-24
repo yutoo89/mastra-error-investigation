@@ -59,7 +59,7 @@ Use this to provide continuity in multi-step workflows and remember user prefere
 - Ask for clarification when needed
 
 Your goal is to help teams build better software by connecting development activity with production monitoring.`,
-  model: 'openai/gpt-4o',
+  model: 'openai/gpt-5',
   tools: async () => {
     // GitHub と Sentry の両方の MCP ツールを取得
     const githubMcp = createGitHubMCPClient();
@@ -78,8 +78,6 @@ Your goal is to help teams build better software by connecting development activ
   },
   memory: new Memory({
     storage: new LibSQLStore({
-      // メモリを永続化する場合は file:../mastra.db を使用
-      // 開発中は :memory: で十分
       url: 'file:../mastra.db',
     }),
   }),
