@@ -50,6 +50,128 @@ class SerialLimiter {
 const notionLimiter = new SerialLimiter();
 
 /**
+ * リトライユーティリティ（指数バックオフ＋ジッター）
+ * 5xx、ネットワークエラー、Cloudflareプロキシエラーを自動リトライ
+ */
+async function withRetry<T>(
+  op: () => Promise<T>,
+  opts = { retries: 6, baseMs: 500, maxMs: 8000 }
+): Promise<T> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await op();
+    } catch (err: any) {
+      attempt++;
+      const status = err?.status ?? err?.code;
+
+      // 一時的障害の判定
+      const transient =
+        // Notion/CDN/ネットワークの一時障害を広めに拾う
+        (typeof status === 'number' && status >= 500) ||
+        err?.code === 'ECONNRESET' ||
+        err?.code === 'ETIMEDOUT' ||
+        err?.message?.includes('http_response_incomplete') ||
+        err?.message?.includes('proxy-status');
+
+      // 429 レート制限の特別処理
+      if (status === 429) {
+        const retryAfter = Number(err.headers?.['retry-after']) || 1;
+        console.warn(`Rate limited (429). Waiting ${retryAfter}s before retry...`);
+        await new Promise(r => setTimeout(r, retryAfter * 1000));
+        continue;
+      }
+
+      // リトライ不可または上限到達時はエラーを投げる
+      if (!transient || attempt > opts.retries) {
+        // デバッグ情報をログ出力
+        console.error('Request failed after retries:', {
+          attempt,
+          status,
+          code: err?.code,
+          message: err?.message,
+          cfRay: err?.headers?.['cf-ray'],
+          proxyStatus: err?.headers?.['proxy-status'],
+        });
+        throw err;
+      }
+
+      // 退避：指数バックオフ＋フルジッター
+      const delay = Math.min(opts.maxMs, Math.random() * (opts.baseMs * 2 ** attempt));
+      console.warn(`Transient error detected (attempt ${attempt}/${opts.retries}). Retrying in ${Math.round(delay)}ms...`, {
+        status,
+        code: err?.code,
+        message: err?.message?.substring(0, 100),
+      });
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
+/**
+ * Sentry: 最新イベントから例外スタックトレースを取得してテキスト化
+ * - issue.permalink (例: https://sentry.io/organizations/.../issues/1234567890/?...) から issueId を抽出
+ * - GET /api/0/issues/{issue_id}/events/latest/
+ * - exception エントリの stacktrace を可読テキスト化
+ */
+async function fetchLatestSentryStacktraceText(issuePermalink: string): Promise<string | null> {
+  const match = issuePermalink.match(/\/issues\/(\d+)\//);
+  const issueId = match?.[1];
+  if (!issueId) {
+    console.warn('Could not extract issueId from permalink:', issuePermalink);
+    return null;
+  }
+
+  const url = `${sentryCfg.baseUrl}/api/0/issues/${issueId}/events/latest/`;
+
+  const json = await withRetry(async () => {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${sentryCfg.authToken}`,
+        Accept: 'application/json',
+      },
+    });
+    if (!res.ok) {
+      throw new Error(`Sentry latest event fetch failed: ${res.status} ${res.statusText}`);
+    }
+    return res.json();
+  });
+
+  // entries[].type === 'exception' を探す
+  const entries = json?.entries ?? [];
+  const exceptionEntry = entries.find((e: any) => e?.type === 'exception');
+  const values = exceptionEntry?.data?.values ?? [];
+
+  if (!values.length) {
+    // 例外エントリが無い場合はイベント全体をサマリ出力（サイズ上限をかける）
+    return `No exception entry in latest event.\n\n` +
+           JSON.stringify(json, null, 2).slice(0, 20000);
+  }
+
+  // スタックをテキストに整形
+  let out = '';
+  for (const v of values) {
+    const type = v?.type ?? 'Error';
+    const value = v?.value ?? '';
+    const mech = v?.mechanism?.type ? ` (${v.mechanism.type})` : '';
+    out += `${type}: ${value}${mech}\n`;
+    // Sentry は frames が古→新のことが多いので、新しい順で見やすく
+    const frames = (v?.stacktrace?.frames ?? []).slice().reverse();
+    for (const f of frames) {
+      const fn = f?.function || '<anonymous>';
+      const file = f?.filename ?? f?.abs_path ?? 'unknown';
+      const line = f?.lineno ?? '?';
+      const col = f?.colno ?? '?';
+      out += `  at ${fn} (${file}:${line}:${col})\n`;
+    }
+    out += '\n';
+  }
+
+  // Safety: Notion 文字量や prompt サイズを圧迫しすぎないように上限
+  return out.slice(0, 20000);
+}
+
+/**
  * Notionブロックの型定義
  */
 type NotionBlock =
@@ -305,7 +427,11 @@ const pickIssuesStep = createStep({
       console.log('issues count:', issues.length);
       console.log('sample issue:', issues[0]);
 
-      return { issues };
+      // 上位2件のみ次ステップへ渡す
+      const top2 = issues.slice(0, 2);
+      console.log(`Limiting to top ${top2.length} issues`);
+
+      return { issues: top2 };
     } catch (error) {
       console.error('Error fetching Sentry issues:', error);
       throw error;
@@ -343,6 +469,14 @@ const investigateSingleIssue = createStep({
     console.log('URL:', issue.url);
     console.log('=========================');
 
+    // Sentry 最新イベントのスタックトレースを取得
+    let stacktraceText: string | null = null;
+    try {
+      stacktraceText = await fetchLatestSentryStacktraceText(issue.url);
+    } catch (e) {
+      console.warn('Failed to fetch Sentry stacktrace:', (e as any)?.message ?? e);
+    }
+
     const prompt = `
 以下のSentry issueについて、詳細に調査してください。
 
@@ -353,6 +487,8 @@ const investigateSingleIssue = createStep({
 - 最初の発生: ${issue.firstSeen}
 - 最後の発生: ${issue.lastSeen}
 ${issue.assignee ? `- 担当者: ${issue.assignee}` : ''}
+
+${stacktraceText ? `## Sentryスタックトレース（最新イベント）\n\`\`\`\n${stacktraceText}\n\`\`\`\n` : ''}
 
 ## 調査してほしいこと:
 1. このエラーの詳細情報（スタックトレース、発生環境など）
@@ -529,81 +665,97 @@ ${issue.assignee ? `- 担当者: ${issue.assignee}` : ''}
             : []),
         ];
 
-        // Notion ページ作成
-        const page = await notion.pages.create({
-          parent: {
-            page_id: notionParentPageId,
-          },
-          properties: {
-            title: {
-              title: [
-                {
-                  type: 'text',
-                  text: {
-                    content: pageTitle,
-                  },
-                },
-              ],
+        // Notion ページ作成（リトライ付き）
+        const page = await withRetry(() =>
+          notion.pages.create({
+            parent: {
+              page_id: notionParentPageId,
             },
-          },
-          children: issueInfoBlocks,
-        });
+            properties: {
+              title: {
+                title: [
+                  {
+                    type: 'text',
+                    text: {
+                      content: pageTitle,
+                    },
+                  },
+                ],
+              },
+            },
+            children: issueInfoBlocks,
+          })
+        );
 
         const pageId = page.id;
         const createdUrl = 'url' in page ? page.url : null;
 
         console.log('Page created:', createdUrl);
 
-        // 「調査結果」見出し追加
-        await notion.blocks.children.append({
-          block_id: pageId,
-          children: [
-            {
-              object: 'block',
-              type: 'heading_2',
-              heading_2: {
-                rich_text: [
-                  {
-                    type: 'text',
-                    text: {
-                      content: '調査結果',
+        // 「調査結果」見出し追加（リトライ付き）
+        await withRetry(() =>
+          notion.blocks.children.append({
+            block_id: pageId,
+            children: [
+              {
+                object: 'block',
+                type: 'heading_2',
+                heading_2: {
+                  rich_text: [
+                    {
+                      type: 'text',
+                      text: {
+                        content: '調査結果',
+                      },
                     },
-                  },
-                ],
+                  ],
+                },
               },
-            },
-          ],
-        });
+            ],
+          })
+        );
 
-        // Rate limit 対策: 1秒待機
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Rate limit 対策: 軽い間隔
+        await new Promise((resolve) => setTimeout(resolve, 400));
 
         // 調査結果をブロック化
         const investigationBlocks = parseInvestigationToBlocks(investigation);
 
         console.log(`Adding ${investigationBlocks.length} investigation blocks...`);
 
-        // 1ブロックずつ追加（1秒間隔）
-        for (let i = 0; i < investigationBlocks.length; i++) {
-          const block = investigationBlocks[i];
-          console.log(`Adding block ${i + 1}/${investigationBlocks.length}...`);
+        // バルク追加（50件ずつのチャンクに分けて送信）
+        const CHUNK_SIZE = 50;
+        for (let i = 0; i < investigationBlocks.length; i += CHUNK_SIZE) {
+          const chunk = investigationBlocks.slice(i, i + CHUNK_SIZE);
+          console.log(`Adding blocks ${i + 1}-${Math.min(i + CHUNK_SIZE, investigationBlocks.length)}/${investigationBlocks.length}...`);
 
-          await notion.blocks.children.append({
-            block_id: pageId,
-            children: [block],
-          });
+          await withRetry(() =>
+            notion.blocks.children.append({
+              block_id: pageId,
+              children: chunk,
+            })
+          );
 
-          // 最後のブロック以外は1秒待機
-          if (i < investigationBlocks.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, 1000));
+          // 軽い間隔（混雑時の平準化）
+          if (i + CHUNK_SIZE < investigationBlocks.length) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
           }
         }
 
         console.log('All blocks added successfully.');
 
         return { notionPageUrl: createdUrl, success: !!createdUrl };
-      } catch (error) {
-        console.error('Error reporting to Notion inside investigateSingleIssue:', error);
+      } catch (error: any) {
+        // 詳細なエラー情報をログ出力（トレーサビリティ向上）
+        console.error('Error reporting to Notion inside investigateSingleIssue:', {
+          message: error?.message,
+          status: error?.status,
+          code: error?.code,
+          cfRay: error?.headers?.['cf-ray'],
+          proxyStatus: error?.headers?.['proxy-status'],
+          requestId: error?.headers?.['x-request-id'],
+          stack: error?.stack?.substring(0, 500), // スタックトレースの一部
+        });
         return { notionPageUrl: null, success: false };
       }
     });
