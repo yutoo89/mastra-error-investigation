@@ -1,3 +1,4 @@
+import { openai } from '@ai-sdk/openai';
 import { Agent } from '@mastra/core/agent';
 import { createNotionMCPClient } from '../mcp/notion-mcp';
 
@@ -35,7 +36,7 @@ When responding:
 - If a page is not found, remind the user to connect it via "..." → "Connect to integration"
 
 Use your tools effectively to help users with their Notion-related tasks.`,
-  model: 'openai/gpt-4o',
+  model: openai('gpt-5-mini'),
   tools: async () => {
     // MCP ツールを遅延初期化
     const mcp = createNotionMCPClient();

@@ -1,4 +1,7 @@
+import { openai } from '@ai-sdk/openai';
 import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
 import { createGitHubMCPClient } from '../mcp/github-mcp';
 
 /**
@@ -29,10 +32,16 @@ When responding:
 - Ask for clarification if the user's request is ambiguous
 
 Use your tools effectively to help users with their GitHub-related tasks.`,
-  model: 'openai/gpt-4o',
+  model: openai('gpt-5-mini'),
   tools: async () => {
-    // MCP ツールを遅延初期化
+    // MCP ツールを遅延初期化（Promiseを返す場合に対応）
     const mcp = createGitHubMCPClient();
-    return await mcp.getTools();
+    const resolvedMcp = mcp instanceof Promise ? await mcp : mcp;
+    return await resolvedMcp.getTools();
   },
+  memory: new Memory({
+      storage: new LibSQLStore({
+        url: 'file:../mastra.db',
+      }),
+    }),
 });
