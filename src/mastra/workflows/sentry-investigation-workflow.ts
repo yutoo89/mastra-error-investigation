@@ -4,17 +4,19 @@ import { Client } from '@notionhq/client';
 import { issueResearchAgent } from '../agents/issue-research-agent';
 import { searchIssues, type SentryConfig } from '../clients/sentry-api';
 
-// Notion クライアントの初期化
-const notion = new Client({
-  auth: process.env.NOTION_TOKEN,
-});
-
 // Sentry設定の初期化
 function envOrThrow(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`${name} is required`);
   return v;
 }
+
+// Notion クライアントの初期化
+const notion = new Client({
+  auth: process.env.NOTION_TOKEN,
+});
+
+const notionParentPageId = '299137fa-86a5-80ea-b239-de4819b28aff';
 
 const sentryCfg: SentryConfig = {
   baseUrl: envOrThrow('SENTRY_MCP_URL'),       // 例: https://us.sentry.io
@@ -32,6 +34,20 @@ const sentryCfg: SentryConfig = {
  * 2. 各issueに対して詳細を調査
  * 3. 調査結果をNotionにレポートとして作成
  */
+
+/**
+ * Notion API の直列化用レートリミッタ
+ * foreach で並列調査中も Notion 呼び出しのみを順番に実行する
+ */
+class SerialLimiter {
+  private last: Promise<unknown> = Promise.resolve();
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.last.then(fn, fn);
+    this.last = next.then(() => undefined, () => undefined);
+    return next;
+  }
+}
+const notionLimiter = new SerialLimiter();
 
 /**
  * Notionブロックの型定義
@@ -191,10 +207,19 @@ const issueSchema = z.object({
   recommendedActions: z.array(z.string()).describe('推奨初動対応のリスト'),
 });
 
-
 // 構造化出力のスキーマ
 const issuesOutputSchema = z.object({
   issues: z.array(issueSchema).describe('検出されたissueのリスト'),
+});
+
+/**
+ * Notion報告結果のスキーマ
+ */
+const notionReportResultSchema = z.object({
+  issue: issueSchema,
+  investigation: z.string(),
+  notionPageUrl: z.string().nullable().describe('作成されたNotionページのURL'),
+  success: z.boolean().describe('Notion報告の成功/失敗'),
 });
 
 /**
@@ -303,16 +328,13 @@ const prepareIssueInvestigation = createStep({
 });
 
 /**
- * ステップ2: 個別issueの詳細を調査
+ * ステップ2: 個別issueの詳細を調査し、Notionに報告
  */
 const investigateSingleIssue = createStep({
   id: 'investigate-single-issue',
-  description: '単一issueの詳細を調査',
+  description: '単一issueの詳細を調査し、Notionに報告',
   inputSchema: issueSchema,
-  outputSchema: z.object({
-    issue: issueSchema.describe('元のissue情報'),
-    investigation: z.string().describe('調査結果'),
-  }),
+  outputSchema: notionReportResultSchema,
   execute: async ({ inputData }) => {
     const issue = inputData;
 
@@ -342,21 +364,18 @@ ${issue.assignee ? `- 担当者: ${issue.assignee}` : ''}
 調査結果をマークダウン形式で整理して報告してください。
 `.trim();
 
+    let investigation: string;
+
     try {
       const response = await issueResearchAgent.generate(prompt, {
         maxSteps: 10,
       });
 
-      const investigation = response.text || '調査結果を取得できませんでした';
+      investigation = response.text || '調査結果を取得できませんでした';
 
       console.log('=== Investigation Result ===');
       console.log(investigation);
       console.log('===========================');
-
-      return {
-        issue,
-        investigation,
-      };
     } catch (error) {
       console.error('Error in issueResearchAgent.generate:', error);
 
@@ -364,7 +383,7 @@ ${issue.assignee ? `- 担当者: ${issue.assignee}` : ''}
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
 
-      let investigation = '## 調査中にエラーが発生しました\n\n';
+      investigation = '## 調査中にエラーが発生しました\n\n';
       investigation += `**エラー概要**: ${errorMessage}\n\n`;
 
       // GitHub MCP接続エラーの場合は具体的なアドバイスを追加
@@ -384,282 +403,220 @@ ${issue.assignee ? `- 担当者: ${issue.assignee}` : ''}
       if (errorStack) {
         investigation += '\n### 詳細スタックトレース\n\n```\n' + errorStack + '\n```\n';
       }
-
-      return {
-        issue,
-        investigation,
-      };
     }
-  },
-});
 
-/**
- * ステップ3の準備: Notion報告用にデータを準備
- */
-const prepareNotionReporting = createStep({
-  id: 'prepare-notion-reporting',
-  description: 'Notion報告のためのデータ準備',
-  inputSchema: z.array(
-    z.object({
-      issue: issueSchema,
-      investigation: z.string(),
-    })
-  ),
-  outputSchema: z.array(
-    z.object({
-      issue: issueSchema,
-      investigation: z.string(),
-    })
-  ),
-  execute: async ({ inputData }) => {
-    return inputData;
-  },
-});
+    // Notion 作成処理を直列化
+    const { notionPageUrl, success } = await notionLimiter.run(async () => {
+      try {
+        console.log('=== Reporting to Notion ===');
+        console.log('Title:', issue.title);
+        console.log('==========================');
 
-/**
- * Notion報告結果のスキーマ
- */
-const notionReportResultSchema = z.object({
-  issue: issueSchema,
-  investigation: z.string(),
-  notionPageUrl: z.string().nullable().describe('作成されたNotionページのURL'),
-  success: z.boolean().describe('Notion報告の成功/失敗'),
-});
+        // ページタイトルと Issue 情報ブロック作成
+        const pageTitle = `Sentry Issue: ${issue.title}`;
 
-/**
- * ステップ3-foreach: 個別issueの調査結果をNotionに報告
- */
-const reportSingleIssueToNotion = createStep({
-  id: 'report-single-issue-to-notion',
-  description: '単一issueの調査結果をNotionに報告',
-  inputSchema: z.object({
-    issue: issueSchema,
-    investigation: z.string(),
-  }),
-  outputSchema: notionReportResultSchema,
-  execute: async ({ inputData }) => {
-    const { issue, investigation } = inputData;
-
-    console.log('=== Reporting to Notion ===');
-    console.log('Title:', issue.title);
-    console.log('URL:', issue.url);
-    console.log('==========================');
-
-    try {
-      // ステップ1: Notion ページを作成（Issue情報のみ）
-      const pageTitle = `Sentry Issue: ${issue.title}`;
-
-      const issueInfoBlocks = [
-        {
-          object: 'block' as const,
-          type: 'heading_2' as const,
-          heading_2: {
-            rich_text: [
-              {
-                type: 'text' as const,
-                text: {
-                  content: 'Issue情報',
-                },
-              },
-            ],
-          },
-        },
-        {
-          object: 'block' as const,
-          type: 'bulleted_list_item' as const,
-          bulleted_list_item: {
-            rich_text: [
-              {
-                type: 'text' as const,
-                text: {
-                  content: `タイトル: ${issue.title}`,
-                },
-              },
-            ],
-          },
-        },
-        {
-          object: 'block' as const,
-          type: 'bulleted_list_item' as const,
-          bulleted_list_item: {
-            rich_text: [
-              {
-                type: 'text' as const,
-                text: {
-                  content: 'URL: ',
-                },
-              },
-              {
-                type: 'text' as const,
-                text: {
-                  content: issue.url,
-                  link: {
-                    url: issue.url,
-                  },
-                },
-              },
-            ],
-          },
-        },
-        {
-          object: 'block' as const,
-          type: 'bulleted_list_item' as const,
-          bulleted_list_item: {
-            rich_text: [
-              {
-                type: 'text' as const,
-                text: {
-                  content: `イベント数: ${issue.events}`,
-                },
-              },
-            ],
-          },
-        },
-        {
-          object: 'block' as const,
-          type: 'bulleted_list_item' as const,
-          bulleted_list_item: {
-            rich_text: [
-              {
-                type: 'text' as const,
-                text: {
-                  content: `最初の発生: ${issue.firstSeen}`,
-                },
-              },
-            ],
-          },
-        },
-        {
-          object: 'block' as const,
-          type: 'bulleted_list_item' as const,
-          bulleted_list_item: {
-            rich_text: [
-              {
-                type: 'text' as const,
-                text: {
-                  content: `最後の発生: ${issue.lastSeen}`,
-                },
-              },
-            ],
-          },
-        },
-        ...(issue.assignee
-          ? [
-              {
-                object: 'block' as const,
-                type: 'bulleted_list_item' as const,
-                bulleted_list_item: {
-                  rich_text: [
-                    {
-                      type: 'text' as const,
-                      text: {
-                        content: `担当者: ${issue.assignee}`,
-                      },
-                    },
-                  ],
-                },
-              },
-            ]
-          : []),
-      ];
-
-      // 環境変数からNotion親ページIDを取得（設定されていない場合はエラー）
-      const notionParentPageId = '299137fa-86a5-80ea-b239-de4819b28aff';
-      const response = await notion.pages.create({
-        parent: {
-          page_id: notionParentPageId,
-        },
-        properties: {
-          title: {
-            title: [
-              {
-                type: 'text',
-                text: {
-                  content: pageTitle,
-                },
-              },
-            ],
-          },
-        },
-        children: issueInfoBlocks,
-      });
-
-      // PageObjectResponse の場合のみ url プロパティが存在する
-      const notionPageUrl = 'url' in response ? response.url : null;
-      const pageId = response.id;
-
-      console.log('Page created:', notionPageUrl);
-
-      // ステップ2: 調査結果を見出しで分割してブロックとして追加
-      // まず「調査結果」見出しを追加
-      await notion.blocks.children.append({
-        block_id: pageId,
-        children: [
+        const issueInfoBlocks = [
           {
-            object: 'block',
-            type: 'heading_2',
+            object: 'block' as const,
+            type: 'heading_2' as const,
             heading_2: {
               rich_text: [
                 {
-                  type: 'text',
+                  type: 'text' as const,
                   text: {
-                    content: '調査結果',
+                    content: 'Issue情報',
                   },
                 },
               ],
             },
           },
-        ],
-      });
+          {
+            object: 'block' as const,
+            type: 'bulleted_list_item' as const,
+            bulleted_list_item: {
+              rich_text: [
+                {
+                  type: 'text' as const,
+                  text: {
+                    content: `タイトル: ${issue.title}`,
+                  },
+                },
+              ],
+            },
+          },
+          {
+            object: 'block' as const,
+            type: 'bulleted_list_item' as const,
+            bulleted_list_item: {
+              rich_text: [
+                {
+                  type: 'text' as const,
+                  text: {
+                    content: 'URL: ',
+                  },
+                },
+                {
+                  type: 'text' as const,
+                  text: {
+                    content: issue.url,
+                    link: {
+                      url: issue.url,
+                    },
+                  },
+                },
+              ],
+            },
+          },
+          {
+            object: 'block' as const,
+            type: 'bulleted_list_item' as const,
+            bulleted_list_item: {
+              rich_text: [
+                {
+                  type: 'text' as const,
+                  text: {
+                    content: `イベント数: ${issue.events}`,
+                  },
+                },
+              ],
+            },
+          },
+          {
+            object: 'block' as const,
+            type: 'bulleted_list_item' as const,
+            bulleted_list_item: {
+              rich_text: [
+                {
+                  type: 'text' as const,
+                  text: {
+                    content: `最初の発生: ${issue.firstSeen}`,
+                  },
+                },
+              ],
+            },
+          },
+          {
+            object: 'block' as const,
+            type: 'bulleted_list_item' as const,
+            bulleted_list_item: {
+              rich_text: [
+                {
+                  type: 'text' as const,
+                  text: {
+                    content: `最後の発生: ${issue.lastSeen}`,
+                  },
+                },
+              ],
+            },
+          },
+          ...(issue.assignee
+            ? [
+                {
+                  object: 'block' as const,
+                  type: 'bulleted_list_item' as const,
+                  bulleted_list_item: {
+                    rich_text: [
+                      {
+                        type: 'text' as const,
+                        text: {
+                          content: `担当者: ${issue.assignee}`,
+                        },
+                      },
+                    ],
+                  },
+                },
+              ]
+            : []),
+        ];
 
-      // Rate limit対策: 1秒待機
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      // 調査結果を見出しで分割してブロックに変換
-      const investigationBlocks = parseInvestigationToBlocks(investigation);
-
-      console.log(`Adding ${investigationBlocks.length} investigation blocks...`);
-
-      // 調査結果のブロックを1つずつ追加（1秒間隔）
-      for (let i = 0; i < investigationBlocks.length; i++) {
-        const block = investigationBlocks[i];
-        console.log(`Adding block ${i + 1}/${investigationBlocks.length}...`);
-
-        await notion.blocks.children.append({
-          block_id: pageId,
-          children: [block],
+        // Notion ページ作成
+        const page = await notion.pages.create({
+          parent: {
+            page_id: notionParentPageId,
+          },
+          properties: {
+            title: {
+              title: [
+                {
+                  type: 'text',
+                  text: {
+                    content: pageTitle,
+                  },
+                },
+              ],
+            },
+          },
+          children: issueInfoBlocks,
         });
 
-        // 最後のブロック以外は1秒待機
-        if (i < investigationBlocks.length - 1) {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+        const pageId = page.id;
+        const createdUrl = 'url' in page ? page.url : null;
+
+        console.log('Page created:', createdUrl);
+
+        // 「調査結果」見出し追加
+        await notion.blocks.children.append({
+          block_id: pageId,
+          children: [
+            {
+              object: 'block',
+              type: 'heading_2',
+              heading_2: {
+                rich_text: [
+                  {
+                    type: 'text',
+                    text: {
+                      content: '調査結果',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+
+        // Rate limit 対策: 1秒待機
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        // 調査結果をブロック化
+        const investigationBlocks = parseInvestigationToBlocks(investigation);
+
+        console.log(`Adding ${investigationBlocks.length} investigation blocks...`);
+
+        // 1ブロックずつ追加（1秒間隔）
+        for (let i = 0; i < investigationBlocks.length; i++) {
+          const block = investigationBlocks[i];
+          console.log(`Adding block ${i + 1}/${investigationBlocks.length}...`);
+
+          await notion.blocks.children.append({
+            block_id: pageId,
+            children: [block],
+          });
+
+          // 最後のブロック以外は1秒待機
+          if (i < investigationBlocks.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
         }
+
+        console.log('All blocks added successfully.');
+
+        return { notionPageUrl: createdUrl, success: !!createdUrl };
+      } catch (error) {
+        console.error('Error reporting to Notion inside investigateSingleIssue:', error);
+        return { notionPageUrl: null, success: false };
       }
+    });
 
-      console.log('All blocks added successfully.');
-
-      console.log('=== Notion Report Result ===');
-      console.log('Success:', !!notionPageUrl);
-      console.log('Page URL:', notionPageUrl);
-      console.log('===========================');
-
-      return {
-        issue,
-        investigation,
-        notionPageUrl,
-        success: !!notionPageUrl,
-      };
-    } catch (error) {
-      console.error('Error reporting to Notion:', error);
-      return {
-        issue,
-        investigation,
-        notionPageUrl: null,
-        success: false,
-      };
-    }
+    return {
+      issue,
+      investigation,
+      notionPageUrl,
+      success,
+    };
   },
 });
+
 
 /**
  * 最終出力のスキーマ
@@ -726,9 +683,7 @@ export const sentryInvestigationWorkflow = createWorkflow({
 })
   .then(pickIssuesStep)
   .then(prepareIssueInvestigation)
-  .foreach(investigateSingleIssue, { concurrency: 5 })
-  .then(prepareNotionReporting)
-  .foreach(reportSingleIssueToNotion, { concurrency: 1 }) // notion APIのrate limitがあるため直列実行
+  .foreach(investigateSingleIssue, { concurrency: 5 }) // 調査は並列、Notionはステップ内で直列化
   .then(summarizeResults);
 
 sentryInvestigationWorkflow.commit();
