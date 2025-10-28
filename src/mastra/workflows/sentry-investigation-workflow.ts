@@ -277,42 +277,28 @@ const createHeading3Block = (text: string): NotionBlock => ({
 });
 
 /**
- * 調査結果のテキストを見出しで分割し、Notionブロックの配列に変換
+ * 調査結果のテキストを改行ごとにNotionブロックの配列に変換
  * - ## で見出し2ブロック
  * - ### で見出し3ブロック
- * - それ以外は段落ブロック
+ * - それ以外は段落ブロック（1行 = 1ブロック）
  * - 各テキストが2000文字を超える場合はさらに分割
  */
 const parseInvestigationToBlocks = (text: string): NotionBlock[] => {
   const lines = text.split('\n');
   const blocks: NotionBlock[] = [];
-  let currentParagraph = '';
 
   for (const line of lines) {
     if (line.startsWith('### ')) {
-      // 現在の段落を追加
-      if (currentParagraph.trim()) {
-        blocks.push(...createParagraphBlocks(currentParagraph.trim()));
-        currentParagraph = '';
-      }
       // 見出し3を追加
       blocks.push(createHeading3Block(line.replace('### ', '')));
     } else if (line.startsWith('## ')) {
-      // 現在の段落を追加
-      if (currentParagraph.trim()) {
-        blocks.push(...createParagraphBlocks(currentParagraph.trim()));
-        currentParagraph = '';
-      }
       // 見出し2を追加
       blocks.push(createHeading2Block(line.replace('## ', '')));
-    } else {
-      currentParagraph += line + '\n';
+    } else if (line.trim()) {
+      // 空行でない場合は段落ブロックを追加（1行 = 1ブロック）
+      blocks.push(...createParagraphBlocks(line));
     }
-  }
-
-  // 最後の段落を追加
-  if (currentParagraph.trim()) {
-    blocks.push(...createParagraphBlocks(currentParagraph.trim()));
+    // 空行はスキップ
   }
 
   return blocks;
@@ -329,10 +315,8 @@ const issueSchema = z.object({
   recommendedActions: z.array(z.string()).describe('推奨初動対応のリスト'),
 });
 
-// 構造化出力のスキーマ
-const issuesOutputSchema = z.object({
-  issues: z.array(issueSchema).describe('検出されたissueのリスト'),
-});
+// foreach は Issue 単体を受け取る
+const investigateInputSchema = issueSchema;
 
 /**
  * Notion報告結果のスキーマ
@@ -353,7 +337,7 @@ const pickIssuesStep = createStep({
   inputSchema: z.object({
     days: z.number().optional().default(7).describe('調査対象の日数(直近N日)'),
   }),
-  outputSchema: issuesOutputSchema,
+  outputSchema: z.array(investigateInputSchema),
   execute: async ({ inputData }) => {
     const { days } = inputData;
 
@@ -378,7 +362,8 @@ const pickIssuesStep = createStep({
       console.log(`=== Found ${data.length} issues ===`);
 
       // Sentry APIレスポンスを構造化スキーマに変換
-      const issues = data.map((issue: any) => {
+      type IssueType = z.infer<typeof issueSchema>;
+      const issues: IssueType[] = data.map((issue: any) => {
         // firstSeen と lastSeen を人間が読みやすい形式に変換
         const firstSeenDate = new Date(issue.firstSeen);
         const lastSeenDate = new Date(issue.lastSeen);
@@ -427,29 +412,15 @@ const pickIssuesStep = createStep({
       console.log('issues count:', issues.length);
       console.log('sample issue:', issues[0]);
 
-      // 上位2件のみ次ステップへ渡す
+      // 上位2件のみ次ステップへ
       const top2 = issues.slice(0, 2);
       console.log(`Limiting to top ${top2.length} issues`);
 
-      return { issues: top2 };
+      return top2;
     } catch (error) {
       console.error('Error fetching Sentry issues:', error);
       throw error;
     }
-  },
-});
-
-/**
- * ステップ2の準備: foreach用にissueの配列を準備
- */
-const prepareIssueInvestigation = createStep({
-  id: 'prepare-issue-investigation',
-  description: 'Issue詳細調査のためのissue配列を準備',
-  inputSchema: issuesOutputSchema,
-  outputSchema: z.array(issueSchema),
-  execute: async ({ inputData }) => {
-    const { issues } = inputData;
-    return issues;
   },
 });
 
@@ -459,7 +430,7 @@ const prepareIssueInvestigation = createStep({
 const investigateSingleIssue = createStep({
   id: 'investigate-single-issue',
   description: '単一issueの詳細を調査し、Notionに報告',
-  inputSchema: issueSchema,
+  inputSchema: investigateInputSchema,
   outputSchema: notionReportResultSchema,
   execute: async ({ inputData }) => {
     const issue = inputData;
@@ -477,6 +448,17 @@ const investigateSingleIssue = createStep({
       console.warn('Failed to fetch Sentry stacktrace:', (e as any)?.message ?? e);
     }
 
+    // スタックトレースは冒頭と末尾だけ抜粋（トークン抑制）
+    function compactText(input: string, keep = 2000) {
+      if (!input) return '';
+      if (input.length <= keep * 2) return input;
+      const head = input.slice(0, keep);
+      const tail = input.slice(-keep);
+      const omitted = input.length - head.length - tail.length;
+      return `${head}\n...<omitted ${omitted} chars>...\n${tail}`;
+    }
+    const condensedStack = stacktraceText ? compactText(stacktraceText, 2000) : null;
+
     const prompt = `
 以下のSentry issueについて、詳細に調査してください。
 
@@ -488,29 +470,237 @@ const investigateSingleIssue = createStep({
 - 最後の発生: ${issue.lastSeen}
 ${issue.assignee ? `- 担当者: ${issue.assignee}` : ''}
 
-${stacktraceText ? `## Sentryスタックトレース（最新イベント）\n\`\`\`\n${stacktraceText}\n\`\`\`\n` : ''}
+${condensedStack ? `## Sentryスタックトレース（要点抜粋）\n\`\`\`\n${condensedStack}\n\`\`\`\n` : ''}
 
 ## 調査してほしいこと:
-1. このエラーの詳細情報（スタックトレース、発生環境など）
-2. エラーの発生パターンや傾向
-3. 影響を受けているユーザー数
-4. 関連する他のissueがあれば特定
-5. 推奨される修正アプローチ
+1. エラーの詳細情報（スタックトレース、発生環境など）
+2. エラーの発生箇所と発生原因
+3. 詳しい人の抽出（関連ファイルの直近のコミット履歴から最大3名）
 
 調査結果をマークダウン形式で整理して報告してください。
+
+## フォーマット:
+
+\`\`\`
+## エラーの詳細情報
+
+{詳細情報}
+
+## 発生箇所と発生原因
+
+{発生箇所と発生原因の調査結果}
+
+## 詳しい人
+
+{リスト形式で最大3名(理由つき)}
+\`\`\`
 `.trim();
+
+    console.log('=== Prompt Preview (first 500 chars) ===');
+    console.log(prompt.slice(0, 500));
 
     let investigation: string;
 
     try {
+      console.log('=== Calling issueResearchAgent.generate ===');
+      console.log('Prompt length:', prompt.length);
+      console.log('maxSteps:', 10);
+
       const response = await issueResearchAgent.generate(prompt, {
         maxSteps: 10,
       });
 
-      investigation = response.text || '調査結果を取得できませんでした';
+      console.log('=== Agent Response Debug ===');
+      console.log('Response object keys:', Object.keys(response));
+
+      // レスポンスの各プロパティの値を確認（冒頭のみ）
+      console.log('\n--- Response Properties ---');
+      Object.keys(response).forEach((key) => {
+        const value = (response as any)[key];
+        const valueType = typeof value;
+
+        if (value === null) {
+          console.log(`${key}: null`);
+        } else if (value === undefined) {
+          console.log(`${key}: undefined`);
+        } else if (valueType === 'string') {
+          console.log(`${key} (string, length ${value.length}):`, value.slice(0, 200));
+        } else if (valueType === 'number' || valueType === 'boolean') {
+          console.log(`${key} (${valueType}):`, value);
+        } else if (Array.isArray(value)) {
+          console.log(`${key} (array, length ${value.length}):`, `[${value.length} items]`);
+        } else if (valueType === 'object') {
+          const objKeys = Object.keys(value);
+          console.log(`${key} (object, ${objKeys.length} keys):`, objKeys.slice(0, 10));
+        } else {
+          console.log(`${key} (${valueType}):`, String(value).slice(0, 100));
+        }
+      });
+
+      console.log('\n--- response.text Details ---');
+      console.log('Type:', typeof response.text);
+      console.log('Length:', response.text?.length ?? 0);
+      console.log('Value (first 500 chars):', response.text ? String(response.text).slice(0, 500) : '(empty)');
+      console.log('Value (last 200 chars):', response.text && response.text.length > 200 ? String(response.text).slice(-200) : '(n/a)');
+
+      // Steps の詳細調査
+      console.log('\n=== Steps Analysis ===');
+      const steps = (response as any)?.steps;
+      if (steps && Array.isArray(steps)) {
+        console.log(`Total steps: ${steps.length}`);
+        steps.forEach((step: any, idx: number) => {
+          console.log(`\n--- Step ${idx + 1} ---`);
+          console.log('Step keys:', Object.keys(step));
+
+          // 各プロパティの値を確認
+          console.log('Step properties:');
+          Object.keys(step).forEach((key) => {
+            const value = step[key];
+            const valueType = typeof value;
+
+            if (value === null || value === undefined) {
+              console.log(`  ${key}: ${value}`);
+            } else if (valueType === 'string') {
+              console.log(`  ${key} (string, ${value.length} chars):`, value.slice(0, 100));
+            } else if (valueType === 'number' || valueType === 'boolean') {
+              console.log(`  ${key}:`, value);
+            } else if (Array.isArray(value)) {
+              console.log(`  ${key}: [array, ${value.length} items]`);
+            } else if (valueType === 'object') {
+              console.log(`  ${key}: {object, ${Object.keys(value).length} keys}`);
+            }
+          });
+
+          console.log('Step type:', step?.stepType || step?.type);
+
+          // text が存在する場合のみ slice
+          const stepText = step?.text;
+          if (stepText && typeof stepText === 'string') {
+            console.log('Step text (first 200 chars):', stepText.slice(0, 200));
+          } else {
+            console.log('Step text: (none)');
+          }
+
+          // ToolCalls の詳細（複数の可能性のある構造に対応）
+          const toolCalls = step?.toolCalls || step?.dynamicToolCalls || step?.staticToolCalls;
+          if (toolCalls && Array.isArray(toolCalls)) {
+            console.log(`\nTool calls: ${toolCalls.length}`);
+            toolCalls.forEach((tc: any, tcIdx: number) => {
+              console.log(`\n  === Tool Call ${tcIdx + 1} ===`);
+              console.log('  Keys:', Object.keys(tc));
+
+              // 各プロパティの値を確認
+              console.log('  Properties:');
+              Object.keys(tc).forEach((key) => {
+                const value = tc[key];
+                const valueType = typeof value;
+
+                if (value === null || value === undefined) {
+                  console.log(`    ${key}: ${value}`);
+                } else if (valueType === 'string') {
+                  console.log(`    ${key} (string, ${value.length} chars):`, value.slice(0, 100));
+                } else if (valueType === 'number' || valueType === 'boolean') {
+                  console.log(`    ${key}:`, value);
+                } else if (Array.isArray(value)) {
+                  console.log(`    ${key}: [array, ${value.length} items]`);
+                } else if (valueType === 'object') {
+                  const objKeys = Object.keys(value);
+                  console.log(`    ${key}: {object, ${objKeys.length} keys}`, objKeys.slice(0, 5));
+                }
+              });
+
+              console.log('  Extracted values:');
+              console.log('    Name:', tc?.toolName || tc?.name || tc?.type);
+              console.log('    IsError:', tc?.isError || tc?.error);
+              console.log('    Error:', tc?.error || tc?.errorMessage);
+
+              // Result の確認
+              const result = tc?.result || tc?.output;
+              if (result) {
+                if (typeof result === 'object') {
+                  console.log('    Result keys:', Object.keys(result));
+                  const resultStr = JSON.stringify(result);
+                  if (resultStr && resultStr.length > 0) {
+                    console.log('    Result (first 300 chars):', resultStr.slice(0, 300));
+                  }
+                } else {
+                  console.log('    Result (non-object):', String(result).slice(0, 300));
+                }
+              } else {
+                console.log('    Result: (none)');
+              }
+            });
+          } else {
+            console.log('\nNo tool calls in this step');
+          }
+        });
+      } else {
+        console.log('No steps found in response');
+      }
+
+      // Messages の確認
+      console.log('\n=== Messages Analysis ===');
+      const messages = (response as any)?.messages;
+      if (messages && Array.isArray(messages)) {
+        console.log(`Total messages: ${messages.length}`);
+        messages.forEach((msg: any, idx: number) => {
+          console.log(`\n--- Message ${idx + 1} ---`);
+          console.log('Role:', msg?.role);
+          console.log('Content type:', typeof msg?.content);
+
+          // content を安全に処理
+          const content = msg?.content;
+          if (content) {
+            const contentStr = JSON.stringify(content);
+            if (contentStr && contentStr.length > 0) {
+              console.log('Content (truncated):', contentStr.slice(0, 300));
+            } else {
+              console.log('Content: (empty string)');
+            }
+          } else {
+            console.log('Content: (none)');
+          }
+        });
+      } else {
+        console.log('No messages found in response');
+      }
+      console.log('===========================');
+
+      // 空テキストは失敗として扱い、エラーメッセージを記録する
+      if (!response.text || !response.text.trim()) {
+        console.warn('!!! Empty response detected !!!');
+
+        const toolErrors =
+          (response as any)?.steps?.flatMap((s: any) => s?.toolCalls ?? [])
+            .filter((tc: any) => tc?.isError)
+            .map((tc: any) => `- ${tc?.toolName ?? 'tool'}: ${tc?.error ?? 'unknown error'}`) ?? [];
+
+        console.log('Tool errors found:', toolErrors.length);
+
+        // すべてのツール呼び出しの結果を確認
+        const allToolCalls = (response as any)?.steps?.flatMap((s: any) => s?.toolCalls ?? []) ?? [];
+        console.log('All tool calls count:', allToolCalls.length);
+        allToolCalls.forEach((tc: any, idx: number) => {
+          console.log(`Tool call ${idx + 1}: ${tc?.toolName}, isError: ${tc?.isError}`);
+        });
+
+        let reason = '';
+        if (toolErrors.length > 0) {
+          reason = `ツール実行時にエラーが発生しました:\n${toolErrors.join('\n')}`;
+        } else if (allToolCalls.length === 0) {
+          reason = 'エージェントがツールを使用せずに空の応答を返しました。プロンプトの問題またはエージェントの初期化失敗の可能性があります。';
+        } else {
+          reason = `エージェントから空の応答が返されました。\n- ツール呼び出し数: ${allToolCalls.length}\n- エラー数: ${toolErrors.length}\n- GitHub API のレート制限またはツール失敗の可能性があります。`;
+        }
+
+        investigation = `## 調査に失敗しました\n\n${reason}\n\n### デバッグ情報\n- Steps: ${steps?.length ?? 0}\n- Tool calls: ${allToolCalls.length}\n- Response keys: ${Object.keys(response).join(', ')}\n`;
+      } else {
+        investigation = response.text;
+      }
 
       console.log('=== Investigation Result ===');
-      console.log(investigation);
+      console.log('Final investigation length:', investigation.length);
+      console.log('Final investigation:', investigation);
       console.log('===========================');
     } catch (error) {
       console.error('Error in issueResearchAgent.generate:', error);
@@ -760,6 +950,12 @@ ${stacktraceText ? `## Sentryスタックトレース（最新イベント）\n\
       }
     });
 
+    // ★ 各 Issue ごとに 1 分待機（rate limit 衝突回避）
+    try {
+      console.log('=== Cooldown: waiting 60s for rate-limit safety ===');
+      await new Promise((r) => setTimeout(r, 60_000));
+    } catch {}
+
     return {
       issue,
       investigation,
@@ -834,8 +1030,8 @@ export const sentryInvestigationWorkflow = createWorkflow({
   outputSchema: finalOutputSchema,
 })
   .then(pickIssuesStep)
-  .then(prepareIssueInvestigation)
-  .foreach(investigateSingleIssue, { concurrency: 5 }) // 調査は並列、Notionはステップ内で直列化
+  // ★ 順次実行に変更（rate limit 衝突を避ける）
+  .foreach(investigateSingleIssue, { concurrency: 1 })
   .then(summarizeResults);
 
 sentryInvestigationWorkflow.commit();
