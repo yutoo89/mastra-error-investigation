@@ -36,32 +36,23 @@ let toolsInitPromise: Promise<Record<string, any>> | null = null;
 async function initializeGithubTools(): Promise<Record<string, any>> {
   // 既にキャッシュされている場合は即座に返す
   if (cachedGithubTools) {
-    console.log('[issueResearchAgent] Using cached GitHub tools');
     return cachedGithubTools;
   }
 
   // 初期化中の場合は同じPromiseを返す
   if (toolsInitPromise) {
-    console.log('[issueResearchAgent] GitHub tools initialization already in progress');
     return toolsInitPromise;
   }
 
   // 初期化開始
   toolsInitPromise = (async () => {
     try {
-      console.log('[issueResearchAgent] Initializing GitHub MCP client...');
-
       // GitHub MCP クライアントを初期化（Promiseを返す場合に対応）
       const githubMcp = createGitHubMCPClient();
       const resolvedMcp = githubMcp instanceof Promise ? await githubMcp : githubMcp;
 
-      console.log('[issueResearchAgent] GitHub MCP client initialized');
-
       // 全ツールを取得
-      console.log('[issueResearchAgent] Fetching GitHub tools...');
       const githubAllTools = await resolvedMcp.getTools();
-
-      console.log('[issueResearchAgent] Available tools:', Object.keys(githubAllTools));
 
       // ホワイトリストでフィルタリング
       cachedGithubTools = Object.fromEntries(
@@ -69,9 +60,6 @@ async function initializeGithubTools(): Promise<Record<string, any>> {
           ALLOWED_GITHUB_TOOLS.includes(toolId)
         )
       );
-
-      console.log(`[issueResearchAgent] Initialized ${Object.keys(cachedGithubTools).length} GitHub tools`);
-      console.log('[issueResearchAgent] Whitelisted tools:', Object.keys(cachedGithubTools));
 
       // ツールが空の場合は警告
       if (Object.keys(cachedGithubTools).length === 0) {
